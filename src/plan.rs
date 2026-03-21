@@ -10,9 +10,9 @@
 //! closure `FnOnce(&mut Context)` will be executed at a given point in time.
 
 use std::cmp::Ordering;
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, VecDeque};
 
-use crate::{trace, HashMap, HashMapExt};
+use crate::trace;
 
 /// A priority queue that stores arbitrary data sorted by time
 ///
@@ -25,12 +25,14 @@ use crate::{trace, HashMap, HashMapExt};
 /// lowest id) is placed earlier.
 ///
 /// The time, plan id, and priority are stored in a binary heap of [`PlanSchedule`]`<P>`
-/// objects. The data payload of the event is stored in a hash map by plan id.
-/// Plan cancellation occurs by removing the corresponding entry from the data
-/// hash map.
+/// objects. The data payload is stored in a `VecDeque` indexed by plan id.
+/// Plan cancellation occurs by setting the corresponding entry to `None`.
 pub struct Queue<T, P: Eq + PartialEq + Ord> {
     queue: BinaryHeap<PlanSchedule<P>>,
-    data_map: HashMap<u64, T>,
+    /// Plan data indexed by `plan_id - base_offset`.
+    data: VecDeque<Option<T>>,
+    /// The plan_id corresponding to `data[0]`.
+    base_offset: u64,
     /// The number of plans that have been added; equivalently, the next plan ID that
     /// will be issued.
     plan_counter: u64,
@@ -48,7 +50,8 @@ impl<T, P: Eq + PartialEq + Ord> Queue<T, P> {
     pub fn new() -> Queue<T, P> {
         Queue {
             queue: BinaryHeap::new(),
-            data_map: HashMap::new(),
+            data: VecDeque::new(),
+            base_offset: 0,
             plan_counter: 0,
             #[cfg(feature = "profiling")]
             max_plans_in_flight: 0,
@@ -63,14 +66,13 @@ impl<T, P: Eq + PartialEq + Ord> Queue<T, P> {
     /// if needed.
     pub fn add_plan(&mut self, time: f64, data: T, priority: P) -> PlanId {
         trace!("adding plan at {time}");
-        // Add plan to queue, store data, and increment counter
         let plan_id = self.plan_counter;
         self.queue.push(PlanSchedule {
             plan_id,
             time,
             priority,
         });
-        self.data_map.insert(plan_id, data);
+        self.data.push_back(Some(data));
         self.plan_counter += 1;
         #[cfg(feature = "profiling")]
         {
@@ -86,9 +88,15 @@ impl<T, P: Eq + PartialEq + Ord> Queue<T, P> {
     /// Cancel a plan that has been added to the queue
     pub fn cancel_plan(&mut self, plan_id: &PlanId) -> Option<T> {
         trace!("cancel plan {plan_id:?}");
-        // Delete the plan from the map, but leave in the queue
-        // It will be skipped when the plan is popped from the queue
-        self.data_map.remove(&plan_id.0)
+        if plan_id.0 < self.base_offset {
+            return None;
+        }
+        let index = (plan_id.0 - self.base_offset) as usize;
+        if index < self.data.len() {
+            self.data[index].take()
+        } else {
+            None
+        }
     }
 
     #[must_use]
@@ -103,18 +111,18 @@ impl<T, P: Eq + PartialEq + Ord> Queue<T, P> {
 
     #[allow(dead_code)]
     pub(crate) fn clear(&mut self) {
-        self.data_map.clear();
+        self.data.clear();
         self.queue.clear();
+        self.base_offset = 0;
         self.plan_counter = 0;
     }
 
     #[must_use]
     #[allow(dead_code)]
     pub(crate) fn peek(&self) -> Option<(&PlanSchedule<P>, &T)> {
-        // Iterate over queue until we find a plan with data or queue is empty
         for entry in &self.queue {
-            // Skip plans that have been cancelled and thus have no data
-            if let Some(data) = self.data_map.get(&entry.plan_id) {
+            let index = (entry.plan_id - self.base_offset) as usize;
+            if let Some(data) = self.data[index].as_ref() {
                 return Some((entry, data));
             }
         }
@@ -127,11 +135,18 @@ impl<T, P: Eq + PartialEq + Ord> Queue<T, P> {
     pub fn get_next_plan(&mut self) -> Option<Plan<T>> {
         trace!("getting next plan");
         loop {
-            // Pop from queue until we find a plan with data or queue is empty
             match self.queue.pop() {
                 Some(entry) => {
-                    // Skip plans that have been cancelled and thus have no data
-                    if let Some(data) = self.data_map.remove(&entry.plan_id) {
+                    if entry.plan_id < self.base_offset {
+                        continue;
+                    }
+                    let index = (entry.plan_id - self.base_offset) as usize;
+                    if let Some(data) = self.data[index].take() {
+                        // Drain leading Nones to reclaim memory
+                        while self.data.front().is_some_and(Option::is_none) {
+                            self.data.pop_front();
+                            self.base_offset += 1;
+                        }
                         return Some(Plan {
                             time: entry.time,
                             data,
@@ -151,10 +166,9 @@ impl<T, P: Eq + PartialEq + Ord> Queue<T, P> {
     pub fn list_schedules(&self, at_most: usize) -> Vec<&PlanSchedule<P>> {
         let mut items = vec![];
 
-        // Iterate over queue until we find a plan with data or queue is empty
         for entry in &self.queue {
-            // Skip plans that have been cancelled and thus have no data
-            if self.data_map.contains_key(&entry.plan_id) {
+            let index = (entry.plan_id - self.base_offset) as usize;
+            if index < self.data.len() && self.data[index].is_some() {
                 items.push(entry);
                 if items.len() == at_most {
                     break;
@@ -172,10 +186,8 @@ impl<T, P: Eq + PartialEq + Ord> Queue<T, P> {
     #[cfg(feature = "profiling")]
     fn estimated_memory_in_use(&self) -> usize {
         let queue_bytes = self.queue.capacity() * size_of::<PlanSchedule<P>>();
-
-        let map_entry_bytes = self.data_map.capacity() * size_of::<(u64, T)>();
-
-        queue_bytes + map_entry_bytes
+        let data_bytes = self.data.capacity() * size_of::<Option<T>>();
+        queue_bytes + data_bytes
     }
 }
 
