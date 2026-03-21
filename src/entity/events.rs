@@ -58,22 +58,16 @@ impl<E: Entity, P: Property<E>> PartialPropertyChangeEvent
             }
         }
 
-        // Now update the indexes
-        let property_value_store = context.get_property_value_store_mut::<E, P>();
-        // Out with the old
-        property_value_store
-            .index
-            .remove_entity(&self.0.previous.make_canonical(), self.0.entity_id);
-        // In with the new
-        property_value_store
-            .index
-            .add_entity(&self.0.current.make_canonical(), self.0.entity_id);
-
-        // We decided not to do the following check.
-        // See `src/entity/context_extension::ContextEntitiesExt::set_property`.
-        // if self.0.current != self.0.previous {
-        //     context.emit_event(self.to_event());
-        // }
+        // Update indexes only if the value actually changed.
+        if self.0.current != self.0.previous {
+            let property_value_store = context.get_property_value_store_mut::<E, P>();
+            property_value_store
+                .index
+                .remove_entity(&self.0.previous.make_canonical(), self.0.entity_id);
+            property_value_store
+                .index
+                .add_entity(&self.0.current.make_canonical(), self.0.entity_id);
+        }
 
         context.emit_event(self.to_event());
     }

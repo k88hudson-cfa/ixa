@@ -2,7 +2,7 @@ use std::any::{Any, TypeId};
 use std::hash::Hash;
 
 use crate::entity::entity_set::{EntitySet, EntitySetIterator, SourceSet};
-use crate::entity::events::{EntityCreatedEvent, PartialPropertyChangeEvent};
+use crate::entity::events::{EntityCreatedEvent, PartialPropertyChangeEvent, PropertyChangeEvent};
 use crate::entity::index::{IndexCountResult, IndexSetResult, PropertyIndexType};
 use crate::entity::property::Property;
 use crate::entity::property_list::PropertyList;
@@ -285,48 +285,15 @@ impl ContextEntitiesExt for Context {
     ) {
         debug_assert!(!P::is_derived(), "cannot set a derived property");
 
-        // The algorithm is as follows:
-        // 1. Snapshot previous values for the main property and its dependents by creating
-        //    `PartialPropertyChangeEvent` instances.
-        // 2. Set the new value of the main property in the property store.
-        // 3. Emit each partial event; during emission each event computes the current value,
-        //    updates its index (remove old/add new), and emits a `PropertyChangeEvent`.
+        // Snapshot dependent values before the main property changes.
+        // Most properties have no dependents, so skip this entirely in the common case.
+        let dependents_slice = P::dependents();
+        let mut dependents: Vec<Box<dyn PartialPropertyChangeEvent>> =
+            Vec::with_capacity(dependents_slice.len());
 
-        // We need two passes over the dependents: one pass to compute all the old values and
-        // another to compute all the new values. We group the steps for each dependent (and, it
-        // turns out, for the main property `P` as well) into two parts:
-        //  1. Before setting the main property `P`, factored out into
-        //     `self.property_store.create_partial_property_change`
-        //  2. After setting the main property `P`, factored out into
-        //     `PartialPropertyChangeEvent::emit_in_context`
-
-        // We decided not to do the following check:
-        // ```rust
-        // let previous_value = { self.get_property_value_store::<E, P>().get(entity_id) };
-        // if property_value == previous_value {
-        //     return;
-        // }
-        // ```
-        // The reasoning is:
-        // - It should be rare that we ever set a property to its present value.
-        // - It's not a significant burden on client code to check `property_value == previous_value` on
-        //   their own if they need to.
-        // - There may be use cases for listening to "writes" that don't actually change values.
-
-        let mut dependents: Vec<Box<dyn PartialPropertyChangeEvent>> = vec![];
-
-        // Immutable: Collect the previous value to create partial property change events
-        {
+        if !dependents_slice.is_empty() {
             let property_store = self.entity_store.get_property_store::<E>();
-
-            // Create the partial property change for this value.
-            dependents.push(property_store.create_partial_property_change(
-                P::id(),
-                entity_id,
-                self,
-            ));
-            // Now create partial property change events for each dependent.
-            for dependent_idx in P::dependents() {
+            for dependent_idx in dependents_slice {
                 dependents.push(property_store.create_partial_property_change(
                     *dependent_idx,
                     entity_id,
@@ -335,14 +302,43 @@ impl ContextEntitiesExt for Context {
             }
         }
 
-        // Update the value
-        let property_value_store = self.get_property_value_store::<E, P>();
-        property_value_store.set(entity_id, property_value);
+        // Replace the value and get the previous value back in one call.
+        let previous = {
+            let property_value_store = self.get_property_value_store::<E, P>();
+            property_value_store.replace(entity_id, property_value)
+        };
+        let current = {
+            let property_value_store = self.get_property_value_store::<E, P>();
+            property_value_store.get(entity_id)
+        };
 
-        // Mutable: After updating the value, we update its dependents, removing old values and
-        // storing the new values in their respective indexes, and emit the property change event.
-        for dependent in dependents.into_iter() {
-            dependent.emit_in_context(self)
+        // Update index and counters for the main property only if the value changed.
+        if current != previous {
+            {
+                let property_value_store = self.get_property_value_store::<E, P>();
+                for counter in &property_value_store.value_change_counters {
+                    counter.borrow_mut().update(entity_id, current, self);
+                }
+            }
+            let property_value_store = self.get_property_value_store_mut::<E, P>();
+            property_value_store
+                .index
+                .remove_entity(&previous.make_canonical(), entity_id);
+            property_value_store
+                .index
+                .add_entity(&current.make_canonical(), entity_id);
+        }
+
+        // Emit the main property change event unconditionally.
+        self.emit_event(PropertyChangeEvent::<E, P> {
+            entity_id,
+            current,
+            previous,
+        });
+
+        // Emit dependent property change events.
+        for dependent in dependents {
+            dependent.emit_in_context(self);
         }
     }
 

@@ -103,3 +103,8 @@ harness = false
 name = "plan_queue"
 path = "criterion/plan_queue.rs"
 harness = false
+
+[[bench]]
+name = "set_property"
+path = "criterion/set_property.rs"
+harness = false
