@@ -69,4 +69,19 @@ pub enum IxaError {
 
     #[error("initialization list is missing required properties")]
     MissingRequiredInitializationProperties,
+
+    #[error("{0}")]
+    IxaError(String),
+}
+
+impl From<&str> for IxaError {
+    fn from(s: &str) -> Self {
+        IxaError::IxaError(s.to_string())
+    }
+}
+
+impl From<String> for IxaError {
+    fn from(s: String) -> Self {
+        IxaError::IxaError(s)
+    }
 }
