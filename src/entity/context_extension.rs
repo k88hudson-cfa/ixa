@@ -229,6 +229,29 @@ pub trait ContextEntitiesExt {
 
     /// Removes all `EntityId`s from the given vector that do not match the given query.
     fn filter_entities<E: Entity, Q: Query<E>>(&self, entities: &mut Vec<EntityId<E>>, query: Q);
+
+    /// Creates `count` entities of type `E` at once with default property values.
+    /// Returns the range of entity IDs that were created.
+    ///
+    /// This is much faster than calling `add_entity` in a loop because it:
+    /// - Allocates all entity IDs in a single counter bump
+    /// - Defers index updates (call `index_property` after bulk loading)
+    /// - Does NOT emit individual `EntityCreatedEvent`s
+    ///
+    /// Use `set_property_column` to set property values for the created entities.
+    fn add_entities_bulk<E: Entity>(&mut self, count: usize) -> std::ops::Range<EntityId<E>>;
+
+    /// Sets the values of property `P` for a contiguous range of entities from a slice.
+    ///
+    /// The slice must have exactly `range.len()` elements. Values are set without
+    /// emitting `PropertyChangeEvent`s (this is initialization, not mutation).
+    ///
+    /// Must only be used during initialization, before the simulation starts.
+    fn set_property_column<E: Entity, P: Property<E>>(
+        &mut self,
+        range: std::ops::Range<EntityId<E>>,
+        values: &[P],
+    );
 }
 
 impl ContextEntitiesExt for Context {
@@ -568,6 +591,46 @@ impl ContextEntitiesExt for Context {
 
     fn filter_entities<E: Entity, Q: Query<E>>(&self, entities: &mut Vec<EntityId<E>>, query: Q) {
         query.filter_entities(entities, self);
+    }
+
+    fn add_entities_bulk<E: Entity>(&mut self, count: usize) -> std::ops::Range<EntityId<E>> {
+        let start = self.entity_store.get_entity_count::<E>();
+        // Bump the entity counter by count in one shot
+        let record = self.entity_store.get_entity_record_mut::<E>();
+        record.entity_count += count;
+        EntityId::new(start)..EntityId::new(start + count)
+    }
+
+    fn set_property_column<E: Entity, P: Property<E>>(
+        &mut self,
+        range: std::ops::Range<EntityId<E>>,
+        values: &[P],
+    ) {
+        assert_eq!(
+            range.end.0 - range.start.0,
+            values.len(),
+            "set_property_column: range length must match values length"
+        );
+        let store = self.get_property_value_store::<E, P>();
+        // Pre-reserve capacity for the full range
+        let needed = range.end.0;
+        let current_len = store.data.len();
+        if needed > current_len {
+            store.data.reserve(needed - current_len);
+            // Fill any gap between current len and range start with defaults
+            if range.start.0 > current_len {
+                store.data.resize(range.start.0, P::default_const());
+            }
+        }
+        // Extend or set values
+        for (i, &value) in values.iter().enumerate() {
+            let idx = range.start.0 + i;
+            if idx < store.data.len() {
+                store.data.set(idx, value);
+            } else {
+                store.data.push(value);
+            }
+        }
     }
 }
 
@@ -1343,5 +1406,118 @@ mod tests {
 
         assert_eq!(*observed_times.borrow(), vec![-2.0, -1.0, 0.0]);
         assert_eq!(*observed_counts.borrow(), vec![1, 0, 0]);
+    }
+
+    #[test]
+    fn test_add_entities_bulk() {
+        let mut context = Context::new();
+        let range = context.add_entities_bulk::<Person>(1000);
+        assert_eq!(range.start.0, 0);
+        assert_eq!(range.end.0, 1000);
+        assert_eq!(context.get_entity_count::<Person>(), 1000);
+
+        // Default-valued properties should work
+        let first: InfectionStatus = context.get_property(EntityId::new(0));
+        let last: InfectionStatus = context.get_property(EntityId::new(999));
+        assert_eq!(first, InfectionStatus::Susceptible);
+        assert_eq!(last, InfectionStatus::Susceptible);
+    }
+
+    #[test]
+    fn test_set_property_column() {
+        let mut context = Context::new();
+        let range = context.add_entities_bulk::<Person>(5);
+
+        let ages = [10u8, 20, 30, 40, 50];
+        let age_values: Vec<Age> = ages.iter().map(|&a| Age(a)).collect();
+        context.set_property_column::<Person, Age>(range.clone(), &age_values);
+
+        for (i, &expected_age) in ages.iter().enumerate() {
+            let actual: Age = context.get_property(EntityId::new(i));
+            assert_eq!(actual, Age(expected_age));
+        }
+    }
+
+    #[test]
+    fn test_bulk_then_index() {
+        let mut context = Context::new();
+        let range = context.add_entities_bulk::<Person>(100);
+
+        let statuses: Vec<InfectionStatus> = (0..100)
+            .map(|i| {
+                if i < 10 {
+                    InfectionStatus::Infected
+                } else {
+                    InfectionStatus::Susceptible
+                }
+            })
+            .collect();
+        context.set_property_column::<Person, InfectionStatus>(range, &statuses);
+
+        // Index after bulk loading
+        context.index_property::<Person, InfectionStatus>();
+
+        assert_eq!(
+            context.query_entity_count::<Person, _>((InfectionStatus::Infected,)),
+            10
+        );
+        assert_eq!(
+            context.query_entity_count::<Person, _>((InfectionStatus::Susceptible,)),
+            90
+        );
+    }
+
+    #[test]
+    fn test_bulk_with_default_property() {
+        let mut context = Context::new();
+        let range = context.add_entities_bulk::<Person>(50);
+
+        // InfectionStatus defaults to Susceptible — set_property_column for a subset
+        let statuses: Vec<InfectionStatus> = (0..50)
+            .map(|i| {
+                if i < 5 {
+                    InfectionStatus::Infected
+                } else {
+                    InfectionStatus::Susceptible
+                }
+            })
+            .collect();
+        context.set_property_column::<Person, InfectionStatus>(range, &statuses);
+
+        // Check the infected ones
+        for i in 0..5 {
+            let s: InfectionStatus = context.get_property(EntityId::new(i));
+            assert_eq!(s, InfectionStatus::Infected);
+        }
+        // Check the rest are susceptible
+        for i in 5..50 {
+            let s: InfectionStatus = context.get_property(EntityId::new(i));
+            assert_eq!(s, InfectionStatus::Susceptible);
+        }
+    }
+
+    #[test]
+    fn test_bulk_mixed_with_regular_add() {
+        let mut context = Context::new();
+
+        // Add some entities normally first
+        let p0 = context.add_entity::<Person, _>((Age(99),)).unwrap();
+        assert_eq!(p0.0, 0);
+
+        // Then bulk add
+        let range = context.add_entities_bulk::<Person>(3);
+        assert_eq!(range.start.0, 1);
+        assert_eq!(range.end.0, 4);
+
+        let ages = [Age(10), Age(20), Age(30)];
+        context.set_property_column::<Person, Age>(range, &ages);
+
+        assert_eq!(context.get_entity_count::<Person>(), 4);
+        let a0: Age = context.get_property(EntityId::new(0));
+        let a1: Age = context.get_property(EntityId::new(1));
+        let a3: Age = context.get_property(EntityId::new(3));
+        assert_eq!(a0, Age(99));
+        assert_eq!(a1, Age(10));
+        assert_eq!(a3, Age(30));
     }
 }

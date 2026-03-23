@@ -244,6 +244,12 @@ impl EntityStore {
         EntityId::new(id)
     }
 
+    /// Returns a mutable reference to the entity record for type `E`.
+    pub(crate) fn get_entity_record_mut<E: Entity>(&mut self) -> &mut EntityRecord {
+        let index = E::id();
+        &mut self.items[index]
+    }
+
     /// Returns a total count of all created entities of type `E`.
     #[must_use]
     pub fn get_entity_count<E: Entity>(&self) -> usize {
